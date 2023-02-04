@@ -2,7 +2,7 @@ name: Build and deploy .NET Core application to Function App AzureTagsIPWatcher
 on:
   push:
     branches:
-    - dev
+    - main
 env:
   AZURE_FUNCTIONAPP_NAME: AzureTagsIPWatcher
   AZURE_FUNCTIONAPP_PACKAGE_PATH: AzureTagsIPWatcher/published
