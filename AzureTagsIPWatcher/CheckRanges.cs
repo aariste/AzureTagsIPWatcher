@@ -48,14 +48,20 @@ namespace AzureTagsIPWatcher
                 dynamic data = JsonConvert.DeserializeObject(body);
                 string serviceTagRegion = data.serviceTagRegion;
 
+                // Get token and call the API
                 var token = GetToken().Result;
 
                 var latestServiceTag = GetFile(token).Result;
 
+                if (latestServiceTag is null)
+                {
+                    throw new Exception("No tag file has been downloaded.");
+                }
+
                 // Download existing file from the blob, if exists, and compare the root changeNumber                
                 var existingServiceTagEntity = await ReadTableAsync();
 
-                // If there's a file in the blob container we retrieve it and compare the changeNumber value. If it's the same there's no changes to the file.
+                // If there's a file in the blob container we retrieve it and compare the changeNumber value. If it's the same there's no changes in the file.
                 if (existingServiceTagEntity is not null)
                 {
                     if (existingServiceTagEntity.ChangeNumber == latestServiceTag.changeNumber)
@@ -70,6 +76,7 @@ namespace AzureTagsIPWatcher
 
                         log.LogInformation("The downloaded file has the same changenumber as the already existing one. No changes.");
 
+                        // Return empty JSON containers
                         return new OkObjectResult(ret);
                     }
                 }
@@ -86,6 +93,7 @@ namespace AzureTagsIPWatcher
                     addresses.nodechangenumber = serviceTagSelected.properties.changeNumber;
                     addresses.addresses = serviceTagSelected.properties.addressPrefixes;
 
+                    // If a file exists in the table get the differences
                     if (existingServiceTagEntity is not null)
                     {
                         string[] existingAddresses = JsonConvert.DeserializeObject<string[]>(existingServiceTagEntity.Addresses);
@@ -98,6 +106,18 @@ namespace AzureTagsIPWatcher
 
                     //await UploadFileAsync(fileName, newAddressJson);
                     await WriteToTableAsync(addresses);
+                }
+                else
+                {
+                    AddressChanges diff = new AddressChanges();
+
+                    diff.addedAddresses = Array.Empty<string>();
+                    diff.removedAddresses = Array.Empty<string>();
+
+                    ret = JsonConvert.SerializeObject(diff);
+
+                    // Return empty JSON containers
+                    return new OkObjectResult(ret);
                 }
             }
             catch (Exception ex)
@@ -179,6 +199,7 @@ namespace AzureTagsIPWatcher
             public string Addresses { get; set; }
         }
 
+        // Gets the authentication token
         public static async Task<string> GetToken()
         {
             HttpClient client = new HttpClient();
@@ -200,6 +221,7 @@ namespace AzureTagsIPWatcher
             return token.access_token;
         }
 
+        // Downloads the file from the Azure REST API
         public static async Task<ServiceTags.ServiceTag> GetFile(string token)
         {
             HttpClient client = new HttpClient();
@@ -242,6 +264,7 @@ namespace AzureTagsIPWatcher
             return ret;
         }
 
+        // Writes the addresses into the Azure Table
         public static async Task WriteToTableAsync(ServiceTagAddresses serviceTagAddresses)
         {
             StorageCredentials creds = new StorageCredentials(Environment.GetEnvironmentVariable("ContainerName"), Environment.GetEnvironmentVariable("StorageKey"));
@@ -266,6 +289,7 @@ namespace AzureTagsIPWatcher
             await table.ExecuteAsync(TableOperation.Insert(serviceTagEntity));
         }
 
+        // Reads from the Azure Table
         public static async Task<ServiceTagEntity> ReadTableAsync()
         {
             StorageCredentials creds = new StorageCredentials(Environment.GetEnvironmentVariable("ContainerName"), Environment.GetEnvironmentVariable("StorageKey"));
@@ -273,12 +297,13 @@ namespace AzureTagsIPWatcher
             CloudTableClient client = account.CreateCloudTableClient();
             CloudTable table = client.GetTableReference(Environment.GetEnvironmentVariable("StorageTable"));
             
-            // retrive data
-            TableQuery<ServiceTagEntity> query = new TableQuery<ServiceTagEntity>();
-            TableContinuationToken token = new TableContinuationToken();            
+            // etrieve data
+            TableQuery<ServiceTagEntity> query = new();
+            TableContinuationToken token = new();            
             
             var data = await table.ExecuteQuerySegmentedAsync(query, token);
 
+            // Return the newest record in the table
             return data.OrderByDescending(r => r.Timestamp).FirstOrDefault();
         }
     }
