@@ -12,9 +12,11 @@ using Microsoft.WindowsAzure.Storage;
 using System.Globalization;
 using System.Linq;
 using System.Net.Http;
-using HtmlAgilityPack;
 using System.Text;
 using System.Net.Http.Headers;
+using Microsoft.WindowsAzure.Storage.Auth;
+using Microsoft.WindowsAzure.Storage.Table;
+using static AzureTagsIPWatcher.CheckRanges;
 
 namespace AzureTagsIPWatcher
 {
@@ -22,13 +24,12 @@ namespace AzureTagsIPWatcher
     {
         [FunctionName("CheckRanges")]
         public static async Task<IActionResult> Run(
-            [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+            [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
             ILogger log)
         {
             log.LogInformation("C# HTTP trigger function processed a request.");
 
             string ret = string.Empty;
-            string fileName = "AzureServiceTags.json";
 
             try
             {
@@ -41,7 +42,7 @@ namespace AzureTagsIPWatcher
 
                 if (string.IsNullOrEmpty(body))
                 {
-                    throw new Exception("No body found.");
+                    throw new Exception("No request body found.");
                 }
 
                 dynamic data = JsonConvert.DeserializeObject(body);
@@ -49,20 +50,15 @@ namespace AzureTagsIPWatcher
 
                 var token = GetToken().Result;
 
-                var serviceTag = GetFile(token).Result;
+                var latestServiceTag = GetFile(token).Result;
 
-                // Download existing file from the blob, if exists, and compare the root changeNumber
-                bool existsFile = FileExistsAsync(fileName).Result;
-                ServiceTagAddresses existingAddresses = new ServiceTagAddresses();
+                // Download existing file from the blob, if exists, and compare the root changeNumber                
+                var existingServiceTagEntity = await ReadTableAsync();
 
                 // If there's a file in the blob container we retrieve it and compare the changeNumber value. If it's the same there's no changes to the file.
-                if (existsFile == true)
+                if (existingServiceTagEntity is not null)
                 {
-                    string existingJson = await DownloadFileAsync(fileName);
-
-                    existingAddresses = JsonConvert.DeserializeObject<ServiceTagAddresses>(existingJson);
-
-                    if (existingAddresses.rootchangenumber == serviceTag.changeNumber)
+                    if (existingServiceTagEntity.ChangeNumber == latestServiceTag.changeNumber)
                     {
                         // Return empty containers in the JSON file
                         AddressChanges diff = new AddressChanges();
@@ -79,32 +75,29 @@ namespace AzureTagsIPWatcher
                 }
 
                 // Process the new file
-                foreach (var val in serviceTag.values)
+                var serviceTagSelected = latestServiceTag.values.FirstOrDefault(st => st.name.ToLower() == serviceTagRegion);
+
+                if (serviceTagSelected is not null)
                 {
-                    if (val.name.ToLower() == serviceTagRegion)
+                    ServiceTagAddresses addresses = new ServiceTagAddresses();
+
+                    addresses.rootchangenumber = latestServiceTag.changeNumber;
+                    addresses.nodename = serviceTagSelected.name;
+                    addresses.nodechangenumber = serviceTagSelected.properties.changeNumber;
+                    addresses.addresses = serviceTagSelected.properties.addressPrefixes;
+
+                    if (existingServiceTagEntity is not null)
                     {
-                        ServiceTagAddresses addresses = new ServiceTagAddresses();
+                        string[] existingAddresses = JsonConvert.DeserializeObject<string[]>(existingServiceTagEntity.Addresses);
 
-                        addresses.rootchangenumber = serviceTag.changeNumber;
-                        addresses.nodename = val.name;
-                        addresses.nodechangenumber = val.properties.changeNumber;
-                        addresses.addresses = val.properties.addressPrefixes;
-
-                        if (existingAddresses.addresses is not null)
-                        {
-                            ret = await CompareFilesAsync(existingAddresses.addresses, addresses.addresses);
-
-                            await ArchiveFileAsync(fileName, string.Format("ServiceTags-{0}.json", DateTime.UtcNow.ToString()));
-                        }
-
-                        // Finally upload the file with the new addresses
-                        var newAddressJson = JsonConvert.SerializeObject(addresses);
-
-                        await UploadFileAsync(fileName, newAddressJson);
-
-
-                        break;
+                        ret = CompareAddresses(existingAddresses, addresses.addresses);
                     }
+
+                    // Finally upload the file with the new addresses
+                    var newAddressJson = JsonConvert.SerializeObject(addresses);
+
+                    //await UploadFileAsync(fileName, newAddressJson);
+                    await WriteToTableAsync(addresses);
                 }
             }
             catch (Exception ex)
@@ -161,7 +154,7 @@ namespace AzureTagsIPWatcher
 
         }
 
-        internal class ServiceTagAddresses
+        public class ServiceTagAddresses
         {
             public int rootchangenumber { get; set; }
             public string nodename { get; set; }
@@ -169,6 +162,22 @@ namespace AzureTagsIPWatcher
             public string[] addresses { get; set; }
         }
 
+        public class ServiceTagEntity : TableEntity
+        {
+            public ServiceTagEntity(string eventId)
+            {
+                this.PartitionKey = "HTTP";
+                this.RowKey = eventId;
+            }
+
+            public ServiceTagEntity() { }
+
+            public int ChangeNumber { get; set; }
+
+            public string NodeName { get; set; }
+
+            public string Addresses { get; set; }
+        }
 
         public static async Task<string> GetToken()
         {
@@ -214,7 +223,7 @@ namespace AzureTagsIPWatcher
         }
 
         // Compares the existing file with the newest downloaded one, and returns a JSON file with the differences
-        public static async Task<string> CompareFilesAsync(string[] existingAddresses, string[] newAddresses)
+        public static string CompareAddresses(string[] existingAddresses, string[] newAddresses)
         {
             string[] removedIPs = existingAddresses.Where(ip => !newAddresses.Contains(ip)).ToArray();
             string[] newIPs = newAddresses.Where(ip => !existingAddresses.Contains(ip)).ToArray();
@@ -227,70 +236,50 @@ namespace AzureTagsIPWatcher
                 diff.addedAddresses = newIPs;
                 diff.removedAddresses = removedIPs;
 
-                string diffFileName = String.Format("diff_{0}", DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmss", CultureInfo.InvariantCulture));
                 ret = JsonConvert.SerializeObject(diff);
-
-                await UploadFileAsync(diffFileName, ret);
             }
 
             return ret;
         }
 
-        // Moves a file from source to destination
-        public static async Task ArchiveFileAsync(string fileName, string archiveFileName)
+        public static async Task WriteToTableAsync(ServiceTagAddresses serviceTagAddresses)
         {
-            var blobSource = GetBlob(Environment.GetEnvironmentVariable("ContainerConn"), Environment.GetEnvironmentVariable("ContainerName"), fileName);
-            var blobDestination = GetBlob(Environment.GetEnvironmentVariable("ContainerConn"), String.Format("{0}/archive", Environment.GetEnvironmentVariable("ContainerName")), fileName);
+            StorageCredentials creds = new StorageCredentials(Environment.GetEnvironmentVariable("ContainerName"), Environment.GetEnvironmentVariable("StorageKey"));
+            CloudStorageAccount account = new CloudStorageAccount(creds, useHttps: true);
+            CloudTableClient client = account.CreateCloudTableClient();
+            CloudTable table = client.GetTableReference(Environment.GetEnvironmentVariable("StorageTable"));
+            ServiceTagEntity serviceTagEntity;
 
-            blobSource.Properties.ContentType = "application/json";
-            blobDestination.Properties.ContentType = "application/json";
+            await table.CreateIfNotExistsAsync();
 
-            await blobDestination.StartCopyAsync(blobSource);
-        }
+            var invertedTimeKey = DateTime.MaxValue.Ticks - DateTime.UtcNow.Ticks;
 
-        // Check if file exists
-        public static async Task<bool> FileExistsAsync(string fileName)
-        {
-            var blob = GetBlob(Environment.GetEnvironmentVariable("ContainerConn"), Environment.GetEnvironmentVariable("ContainerName"), fileName);
-
-            return await blob.ExistsAsync();
-        }
-
-        // Uploads a file to the blob storage account configured in the environment variables
-        public static async Task UploadFileAsync(string fileName, string content)
-        {
-            var blob = GetBlob(Environment.GetEnvironmentVariable("ContainerConn"), Environment.GetEnvironmentVariable("ContainerName"), fileName);
-
-            using (Stream stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(content)))
+            serviceTagEntity = new ServiceTagEntity()
             {
-                await blob.UploadFromStreamAsync(stream);
-            }
+                PartitionKey = "HTTP",
+                RowKey = invertedTimeKey.ToString(),
+                NodeName = serviceTagAddresses.nodename,
+                ChangeNumber = serviceTagAddresses.rootchangenumber,
+                Addresses = JsonConvert.SerializeObject(serviceTagAddresses.addresses)
+            };
 
+            await table.ExecuteAsync(TableOperation.Insert(serviceTagEntity));
+        }
+
+        public static async Task<ServiceTagEntity> ReadTableAsync()
+        {
+            StorageCredentials creds = new StorageCredentials(Environment.GetEnvironmentVariable("ContainerName"), Environment.GetEnvironmentVariable("StorageKey"));
+            CloudStorageAccount account = new CloudStorageAccount(creds, useHttps: true);
+            CloudTableClient client = account.CreateCloudTableClient();
+            CloudTable table = client.GetTableReference(Environment.GetEnvironmentVariable("StorageTable"));
             
-        }
+            // retrive data
+            TableQuery<ServiceTagEntity> query = new TableQuery<ServiceTagEntity>();
+            TableContinuationToken token = new TableContinuationToken();            
+            
+            var data = await table.ExecuteQuerySegmentedAsync(query, token);
 
-        // Downloads a file from the blob storage account configured in the environment variables
-        public static async Task<string> DownloadFileAsync(string fileName)
-        {
-            var blob = GetBlob(Environment.GetEnvironmentVariable("ContainerConn"), Environment.GetEnvironmentVariable("ContainerName"), fileName);
-
-            var memoryStream = new MemoryStream();
-
-            await blob.DownloadToStreamAsync(memoryStream);
-
-            return System.Text.Encoding.UTF8.GetString(memoryStream.ToArray());
-        }
-
-        public static CloudBlockBlob GetBlob(string containerConnection, string containerName, string fileName)
-        {
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(containerConnection);
-            CloudBlobClient blobClient = storageAccount.CreateCloudBlobClient();
-            CloudBlobContainer container = blobClient.GetContainerReference(containerName);
-            CloudBlockBlob blob = container.GetBlockBlobReference(fileName);
-                        
-            blob.Properties.ContentType = "application/json";
-
-            return blob;
+            return data.OrderByDescending(r => r.Timestamp).FirstOrDefault();
         }
     }
 }
