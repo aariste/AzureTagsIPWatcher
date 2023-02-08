@@ -1,4 +1,4 @@
-# AzureTagsIPWatcher
+# Azure IP ranges and service tags monitor
 
 This repo contains an Azure function that will query the Azure REST API to get the IP address ranges of a service and region.
 
