@@ -44,11 +44,17 @@ namespace AzureTagsIPWatcher
 
                 dynamic data = JsonConvert.DeserializeObject(body);
                 string serviceTagRegion = data.serviceTagRegion;
+                string region = data.region;
+
+                if (string.IsNullOrEmpty(serviceTagRegion) || string.IsNullOrEmpty(region))
+                {
+                    throw new Exception("The values in the cannot be empty.");
+                }
 
                 // Get token and call the API
                 var token = GetToken().Result;
 
-                var latestServiceTag = GetFile(token).Result;
+                var latestServiceTag = GetFile(token, region).Result;
 
                 if (latestServiceTag is null)
                 {
@@ -219,12 +225,12 @@ namespace AzureTagsIPWatcher
         }
 
         // Downloads the file from the Azure REST API
-        public static async Task<ServiceTags.ServiceTag> GetFile(string token)
+        public static async Task<ServiceTags.ServiceTag> GetFile(string token, string region)
         {
             HttpClient client = new HttpClient();
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-            string url = Environment.GetEnvironmentVariable("apiURL");
+            string url = string.Format(Environment.GetEnvironmentVariable("apiURL"), region);
 
             string content = string.Empty;
 
