@@ -45,9 +45,10 @@ namespace AzureTagsIPWatcher
                 dynamic data = JsonConvert.DeserializeObject(body);
                 string serviceTagRegion = data.serviceTagRegion;
 
+                log.LogInformation("Before token");
                 // Get token and call the API
                 var token = GetToken().Result;
-
+                log.LogInformation("Before API");
                 var latestServiceTag = GetFile(token).Result;
 
                 if (latestServiceTag is null)
@@ -55,9 +56,12 @@ namespace AzureTagsIPWatcher
                     throw new Exception("No tag file has been downloaded.");
                 }
 
+                log.LogInformation("After API");
+
                 // Download existing file from the blob, if exists, and compare the root changeNumber                
                 var existingServiceTagEntity = await ReadTableAsync();
 
+                log.LogInformation("Before check changenumber");
                 // If there's a file in the blob container we retrieve it and compare the changeNumber value. If it's the same there's no changes in the file.
                 if (existingServiceTagEntity is not null)
                 {
@@ -78,11 +82,13 @@ namespace AzureTagsIPWatcher
                     }
                 }
 
+                log.LogInformation("Before select service tags");
                 // Process the new file
                 var serviceTagSelected = latestServiceTag.values.FirstOrDefault(st => st.name.ToLower() == serviceTagRegion);
 
                 if (serviceTagSelected is not null)
                 {
+                    log.LogInformation("Found service tags");
                     ServiceTagAddresses addresses = new ServiceTagAddresses();
 
                     addresses.rootchangenumber = latestServiceTag.changeNumber;
@@ -106,6 +112,7 @@ namespace AzureTagsIPWatcher
                 }
                 else
                 {
+                    log.LogInformation("Not found them");
                     AddressChanges diff = new AddressChanges();
 
                     diff.addedAddresses = Array.Empty<string>();
@@ -122,6 +129,7 @@ namespace AzureTagsIPWatcher
                 return new BadRequestObjectResult(ex.Message);
             }
 
+            log.LogInformation("END");
             return new OkObjectResult(ret);
         }
 
